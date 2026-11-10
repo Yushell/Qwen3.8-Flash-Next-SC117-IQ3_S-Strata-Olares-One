@@ -1,8 +1,8 @@
 # Qwen3.8-Flash-Next · SC117 IQ3_S · Strata on Olares One
 
-A production lane for **Qwen3.8-Flash-Next** (125B MoE, 3B active) on a single **Olares One** (RTX 5090 Laptop, 24 GB VRAM, 91 GB RAM): the **SC117 abliterated GSQ-RCO IQ3_S** pack served by the **Strata** engine at **262,144 context**, with int8 KV streaming, MTP speculative decode, vision, and an OpenAI-compatible API on `:8001`. It runs as a **systemd user unit with a supervisor** that owns readiness, load shape and a GPU ceiling.
+A serving recipe for **Qwen3.8-Flash-Next** (125B MoE, 3B active) on a single **Olares One** (RTX 5090 Laptop, 24 GB VRAM, 91 GB RAM): the **SC117 abliterated GSQ-RCO IQ3_S** pack served by the **Strata** engine at **262,144 context**, with int8 KV streaming, MTP speculative decode, vision, and an OpenAI-compatible API on `:8001`. It runs as a **systemd user unit with a supervisor** that owns readiness, load shape and a GPU ceiling.
 
-Everything here was measured on the box in October and November 2026. The engine beats llama.cpp on the same shards by 2.6x decode and 4-6x prefill; this repo is the config, the unit, the supervisor and the numbers.
+Everything here was measured on this hardware class in October and November 2026. The engine beats llama.cpp on the same shards by 2.6x decode and 4-6x prefill; this repo is the config, the unit, the supervisor and the numbers.
 
 **The weights are not hosted here** (79 GB). This repo is the serving kit and the measured record.
 
@@ -97,7 +97,7 @@ The supervisor waits for `/health` `loaded: true` **and** a live engine child (a
 
 ## Calibration and knobs
 
-The engine's calibrator (`tools/calibrate.py`, run with the engine venv) measured these on this box in 486 s:
+The engine's calibrator (`tools/calibrate.py`, run with the engine venv) measured these on the reference machine in 486 s:
 
 - **`--pool-workers 23`** beat 15, 12, 7 and 6 (IQ3_S 115.7 to 121.2 t/s against 107.9 at 10 workers).
 - **`--pcie-frac 0`** beat the default 0.25 (126.4 vs 124.3 t/s median of 3); every higher share lost, so misses are computed on the CPU pool instead of copied.
