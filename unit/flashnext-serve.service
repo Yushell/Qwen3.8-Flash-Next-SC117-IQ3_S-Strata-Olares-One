@@ -1,0 +1,20 @@
+[Unit]
+Description=Qwen3.8-Flash-Next OpenAI-compatible inference server (Strata engine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=FLASHNEXT_ENV=%h/.config/flashnext-serve.env
+ExecStart=%h/.local/bin/flashnext-serve.sh
+Restart=on-failure
+RestartSec=10
+# Host-RAM ceiling. The engine keeps the routed experts resident in host RAM by design
+# (~44-46 GiB for this model) plus ~3 GiB of pinned K/V, so the cap must sit above those
+# and below a runaway: the value here is the lane's own footprint + headroom, not a target.
+MemoryMax=75000M
+# The GPU cap is enforced by the supervisor (flashnext-serve.sh): the engine sizes its own
+# expert cache and exposes no VRAM budget flag, so the supervisor kills it above VRAM_CAP_MIB.
+
+[Install]
+WantedBy=default.target
