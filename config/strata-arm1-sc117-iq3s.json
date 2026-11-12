@@ -33,11 +33,13 @@
   "--pool-workers",
   "23",
   "--conversation-cache-mib",
-  "6144",
+  "10240",
   "--conversation-cache-slots",
-  "2",
+  "4",
   "--pcie-frac",
-  "0"
+  "0",
+  "--conversation-cache-min-tokens",
+  "2048"
  ],
  "cwd": "/opt/strata",
  "tokenizer": "/var/lib/strata-data/packs/sc117_iq3_s/tokenizer",

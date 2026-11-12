@@ -23,16 +23,19 @@ The full attribution list is at the end of this README.
 | Metric | Result |
 |---|---|
 | Served id | `qwen3.8-flash-next-sc117-iq3_s` (one request at a time, `total_slots: 1`) |
-| Engine | Strata **0.1.59** (source build, v0.2.13.1 line + dev commits), sm_120, CUDA 13.0 |
+| Engine | Strata **0.1.59.1** (source build, v0.2.13.1 line + dev commits), sm_120, CUDA 13.0 |
 | Decode, short prompts | **121-128 t/s** median (109.7-131.4 across runs); ~112-117 t/s after a 25K-token fill |
+| Decode, agent work | **135-139 t/s** across six mixed tasks at a 34K-token context with tools and thinking on (`scripts/decode_battery.py`) |
 | Prefill | **3,523-3,569 t/s** on a fresh 28.8K prompt |
 | Long context | 28,843-token needle exact; 250K-token needle exact in a 51-86 s read (the 2026-10-14 battery) |
+| Returning to a parked conversation | **0.2-0.6 s** for a 38K-53K-token conversation after side requests and two other long conversations; the same turns cost an 11-16 s re-read with a 2-slot cache |
+| Conversations held at once | four of 91K-107K tokens (398K tokens) in 7.97 GiB of host RAM, each back in 0.5-1.1 s |
 | Tool calls | `get_weather` exact through the OpenAI path; `tool_call_recovery` on by default since 0.2.8 |
 | Vision | pass (BF16 mmproj, separate GPU vision child) |
 | Load | ~30 s from restart to loaded (2026-11-10: 11:25:11 to 11:25:41); engine VRAM 22,786 MiB; process-tree RSS 53 GiB |
 | Context | 262,144 tokens, int8 KV with 32,768 cells resident |
 | Weights | SC117 IQ3_S: 55.06 GB + 28.80 GB GGUF shards, 907 MB BF16 mmproj, ~1.2 GB Strata runtime pack (79 GB total) |
-| Host RAM while loaded | ~57 of 91 GB used; ~33 GB available |
+| Host RAM while loaded | ~57 of 91 GB used with an empty conversation cache (~33 GB available); parked conversations add up to 10 GiB |
 
 ## The quantization choice
 
@@ -95,17 +98,48 @@ Prerequisites: a 24 GB sm_120 card with ~90 GB of system RAM, CUDA 13.0, a Pytho
 
 The supervisor waits for `/health` `loaded: true` **and** a live engine child (a stale server can hold the port), checks the engine's own VRAM (14,000 MiB floor) and the **process tree's** RSS (35 GiB floor; measuring the Python wrapper alone passes on garbage), then applies `REASONING_EFFORT` as the lane default and enforces a whole-GPU ceiling (23,700 MiB, two strikes).
 
+## The conversation cache (the setting that matters for agents)
+
+An agent session is one long conversation that keeps coming back, interleaved with short side requests (a title, a command approval, a picture, a summary) and sometimes with other long conversations. The engine keeps one conversation in the GPU and parks the others in host RAM. If a parked conversation is evicted, its next turn re-reads the whole prompt: about 30 s per 100K tokens on this card.
+
+With `--conversation-cache-slots 2` and every request parked, two short side requests in a row are enough to evict a long conversation. The config here uses **4 slots, 10240 MiB, and `--conversation-cache-min-tokens 2048`**, so short requests never take a slot.
+
+Measured with `scripts/cache_scenario.py` (three conversations of 38K-53K tokens and five side requests, in the order agent traffic produces them; every figure is the engine's own per-request record):
+
+| Returning turn | 2 slots, park everything | 4 slots, park 2,048+ tokens |
+|---|---|---|
+| A after three side requests | 0 reused, 52,777 read, 14.74 s | 52,752 reused, 0.20 s |
+| A after B and C | 52,824 reused, 0.25 s | 52,824 reused, 0.61 s |
+| B after two side requests | 0 reused, 50,727 read, 14.43 s | 50,697 reused, 0.22 s |
+| C after that | 0 reused, 38,217 read, 10.97 s | 38,192 reused, 0.38 s |
+| A after that | 0 reused, 52,914 read, 15.57 s | 52,885 reused, 0.42 s |
+| **Prompt time on the five turns** | **56.0 s** | **1.8 s** |
+
+- **Capacity** (`scripts/cache_fill.py`): four different conversations of 91K-107K tokens were held at once and each came back in 0.5-1.1 s (27.8-32.7 s cold). The cache peaked at 7.97 GiB of its 10; the unit's cgroup went from 49.1 to 57.3 GiB of anonymous memory under the 73.2 GiB `MemoryMax`, with no OOM kill.
+- **A parked conversation costs** about 0.24 GB plus roughly 19 KB per token of host RAM (a 228K-token conversation is 4.6 GB). Size `--conversation-cache-mib` against the unit's `MemoryMax` minus the engine's own footprint.
+- **Find out whether your traffic has the problem** with `scripts/strata_traffic_report.py <engine log>`: it reads the engine's per-request lines and lists every conversation that was evicted and read again from token 0, with what sat between the two turns. On the reference machine the 2-slot config showed 27 such re-reads in two weeks (median 26 s, worst 45 s), and prompt reading took 36% of the engine's time.
+- A restart empties the cache, so each open conversation pays one cold read afterwards.
+
 ## Calibration and knobs
 
 The engine's calibrator (`tools/calibrate.py`, run with the engine venv) measured these on the reference machine in 486 s:
 
-- **`--pool-workers 23`** beat 15, 12, 7 and 6 (IQ3_S 115.7 to 121.2 t/s against 107.9 at 10 workers).
+- **`--pool-workers 23`** beat 15, 12, 7 and 6 (IQ3_S 115.7 to 121.2 t/s against 107.9 at 10 workers). Re-measured on 0.1.59.1 with `scripts/decode_battery.py`, one fresh engine start per arm (table below): 15 workers, which the engine's own start-up warning recommends for this CPU, is 2-7% slower on every probe, and `--pool-affinity p-cores` runs at about half speed.
 - **`--pcie-frac 0`** beat the default 0.25 (126.4 vs 124.3 t/s median of 3); every higher share lost, so misses are computed on the CPU pool instead of copied.
 - **`--spec-min-p 0.7`** confirmed best (131.4 vs 129.1 at 0.3 and 125.7 at 0.5).
 - The adaptive expert tier stayed at the engine default (`1/160/0.97`, +1.5%, under the 3% keep threshold).
-- **`STRATA_ROUTE_TAIL_SKIP=7`** is the one big speed lever left and is **off on purpose**: the publisher measured it moving answers by about as much as its quantization does.
+- **`STRATA_ROUTE_TAIL_SKIP=7` is on**: it is the engine's default for IQ packs since 0.1.42 (it is off by default only for NVFP4 experts, where the publisher measured it moving answers by about as much as the quantization does). On this recipe it skips 5-7% of expert lookups, about half of the cache misses. The publisher's cost on 12-16 GB cards is KL 0.003-0.006 against the previous behaviour with HumanEval unchanged; `STRATA_ROUTE_TAIL_SKIP=0` in the config's `env` block turns it off (speed cost not measured here).
+- **The power profile does not matter**: Balanced and Performance measured the same (149.1 against 149.8 t/s mean over the five short probes), because under generation all 24 cores hold about 4.1 GHz and 59-63 W in both.
 
-Other served settings: `--max-context 262144`, `--kv int8 --kv-resident 32768`, `--vram-reserve-mib 1000`, `--conversation-cache-mib 6144 --conversation-cache-slots 2`, `--expert-cache auto --prefill auto --spec 4`, MTP with `--mtp-draft-vocab`, vision on. Sampling and thinking are per request; the lane default effort is `medium` (`/settings` accepts `none|low|medium|high`; the request surface accepts the full vocabulary).
+| Arm (0.1.59.1) | prose | code | JSON | sampled prose | Spanish | agent work | GPU |
+|---|---:|---:|---:|---:|---:|---:|---|
+| **23 workers** | 133.2 | 179.6 | 194.4 | 114.8 | 123.9 | **139.3** | 157 W, 96% |
+| 15 workers | 125.8 | 170.4 | 190.6 | 107.2 | 116.0 | 133.7 | 154 W, 98% |
+| P-cores only (7) | 71.1 | 75.4 | 93.3 | 50.2 | 64.8 | 59.8 | 119 W, 93% |
+
+Tokens per second from the engine's own record; short probes are the median of 2-4 runs with thinking off, agent work is about 6,000 tokens per arm at an expert hit rate near 0.89.
+
+Other served settings: `--max-context 262144`, `--kv int8 --kv-resident 32768`, `--vram-reserve-mib 1000`, `--conversation-cache-mib 10240 --conversation-cache-slots 4 --conversation-cache-min-tokens 2048`, `--expert-cache auto --prefill auto --spec 4`, MTP with `--mtp-draft-vocab`, vision on. Sampling and thinking are per request; the lane default effort is `medium` (`/settings` accepts `none|low|medium|high`; the request surface accepts the full vocabulary).
 
 ## Notes and gotchas
 
@@ -117,7 +151,8 @@ Other served settings: `--max-context 262144`, `--kv int8 --kv-resident 32768`, 
 - **A request must fit `prompt + max_tokens <= 262144`.** The server 4xxs instead of truncating, so a client's `max_tokens` reserves prompt headroom (32,768 gives prompts up to 229,376).
 - **Servicing the engine:** re-apply the sanitizer patch after every `git pull` (`patches/patch_strata_sanitize.py`; it rewrites `serve/server.py`), then run the serve tests and restart the unit. The update flow and the pin to check (`engine/BUILD.json`) are in the Strata repo's docs.
 - **If the display freezes or goes black once loaded**, raise `--vram-reserve-mib` to 1500 in the config (the card also drives a display). The shipped lane runs 1000 and stayed stable through every battery.
-- **Several clients at once**: `--conversation-cache-mib 8192` keeps each conversation; the shipped lane runs 6144 with 2 slots.
+- **Several clients or agent side requests**: the config parks up to 4 conversations in 10240 MiB and only those of 2,048+ tokens. With 2 slots and no minimum, two short side requests evict a long conversation and its next turn re-reads the whole prompt (see the conversation cache section).
+- **Restarting through a launcher script**: if your launcher rewrites `REASONING_EFFORT` in the env file on start, pass the level you want every time; an empty value leaves the engine's saved `/settings` default in charge.
 - **Not affiliated** with any upstream authors; see Credits for the full attribution and licenses.
 
 ## What is not measured here
@@ -126,6 +161,7 @@ Other served settings: `--max-context 262144`, `--kv int8 --kv-resident 32768`, 
 - The quality column is the publisher's measurement, not re-measured here (a Q8_0 reference run of the 188 GB model is needed).
 - Vision is configured and passes a probe, but no image battery was run.
 - Concurrency is one request at a time by design; parallel slots cost 10-25% per request on this card.
+- The conversation-cache numbers come from scripted conversations and one two-week log, not from a long-run comparison of the two settings under the same traffic.
 
 ## Credits
 
